@@ -1,20 +1,23 @@
 package xtermjs
 
 import (
-	"bytes"
 	"cloudshell/internal/log"
-	"encoding/json"
+	"context"
+	"crypto/tls"
 	"fmt"
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"net/http"
-	"os"
-	"os/exec"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/creack/pty"
-	"github.com/google/uuid"
-	"github.com/gorilla/websocket"
 )
 
 const DefaultConnectionErrorLimit = 10
@@ -23,7 +26,7 @@ type HandlerOpts struct {
 	// AllowedHostnames is a list of strings which will be matched to the client
 	// requesting for a connection upgrade to a websocket connection
 	AllowedHostnames []string
-	// Arguments is a list of strings to pass as arguments to the specified COmmand
+	// Arguments is a list of strings to pass as arguments to the specified Command
 	Arguments []string
 	// Command is the path to the binary we should create a TTY for
 	Command string
@@ -38,10 +41,16 @@ type HandlerOpts struct {
 	// cycle should be tolerated, beyond this the connection should be deemed dead
 	KeepalivePingTimeout time.Duration
 	MaxBufferSizeBytes   int
+	// Kubernetes
+	KubernetesHost      string
+	KubernetesNamespace string
+	PodName             string
+	KubernetesToken     string
 }
 
 func GetHandler(opts HandlerOpts) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Initialize connection parameters
 		connectionErrorLimit := opts.ConnectionErrorLimit
 		if connectionErrorLimit < 0 {
 			connectionErrorLimit = DefaultConnectionErrorLimit
@@ -52,6 +61,7 @@ func GetHandler(opts HandlerOpts) func(http.ResponseWriter, *http.Request) {
 			keepalivePingTimeout = 20 * time.Second
 		}
 
+		// Create connection UUID and logger
 		connectionUUID, err := uuid.NewUUID()
 		if err != nil {
 			message := "failed to get a connection uuid"
@@ -66,156 +76,280 @@ func GetHandler(opts HandlerOpts) func(http.ResponseWriter, *http.Request) {
 		}
 		clog.Info("established connection identity")
 
-		allowedHostnames := opts.AllowedHostnames
-		upgrader := getConnectionUpgrader(allowedHostnames, maxBufferSizeBytes, clog)
+		// Upgrade to websocket connection
+		upgrader := getConnectionUpgrader(opts.AllowedHostnames, maxBufferSizeBytes, clog)
 		connection, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			clog.Warnf("failed to upgrade connection: %s", err)
 			return
 		}
+		defer connection.Close()
 
-		terminal := opts.Command
-		args := opts.Arguments
-		clog.Debugf("starting new tty using command '%s' with arguments ['%s']...", terminal, strings.Join(args, "', '"))
-		cmd := exec.Command(terminal, args...)
-		cmd.Env = os.Environ()
-		tty, err := pty.Start(cmd)
+		// Create main context for the connection
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// Generate pod name
+		podName := fmt.Sprintf("xtermjs-%s", connectionUUID.String())
+
+		// Create Kubernetes config
+		config, err := rest.InClusterConfig()
 		if err != nil {
-			message := fmt.Sprintf("failed to start tty: %s", err)
-			clog.Warn(message)
-			connection.WriteMessage(websocket.TextMessage, []byte(message))
+			config = &rest.Config{
+				Host: strings.TrimPrefix(opts.KubernetesHost, "https://"),
+				TLSClientConfig: rest.TLSClientConfig{
+					Insecure: true,
+				},
+				BearerToken: opts.KubernetesToken,
+			}
+		} else {
+			config.BearerToken = opts.KubernetesToken
+			config.Host = strings.TrimPrefix(opts.KubernetesHost, "https://")
+			config.TLSClientConfig.Insecure = true
+		}
+
+		// Create Kubernetes clientset
+		clientset, err := kubernetes.NewForConfig(config)
+		if err != nil {
+			clog.Warnf("failed to create clientset: %s", err)
 			return
 		}
+
+		// Define container spec
+		container := corev1.Container{
+			Name:    "shell",
+			Image:   "alpine",
+			Command: []string{"tail", "-f", "/dev/null"},
+			Stdin:   true,
+			TTY:     true,
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("100m"),
+					corev1.ResourceMemory: resource.MustParse("64Mi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("500m"),
+					corev1.ResourceMemory: resource.MustParse("256Mi"),
+				},
+			},
+			ImagePullPolicy: corev1.PullIfNotPresent,
+		}
+
+		// Define pod spec
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      podName,
+				Namespace: opts.KubernetesNamespace,
+			},
+			Spec: corev1.PodSpec{
+				Containers:    []corev1.Container{container},
+				RestartPolicy: corev1.RestartPolicyAlways,
+				SecurityContext: &corev1.PodSecurityContext{
+					RunAsUser:  int64Ptr(1000),
+					RunAsGroup: int64Ptr(1000),
+				},
+			},
+		}
+
+		clog.Infof("Creating Pod %s in namespace %s", podName, opts.KubernetesNamespace)
+
+		// Create pod with timeout
+		createCtx, createCancel := context.WithTimeout(ctx, 30*time.Second)
+		defer createCancel()
+		_, err = clientset.CoreV1().Pods(opts.KubernetesNamespace).Create(createCtx, pod, metav1.CreateOptions{})
+		if err != nil {
+			clog.Errorf("Failed to create Pod: %s", err)
+			if statusErr, ok := err.(*errors.StatusError); ok {
+				clog.Errorf("Status: %v", statusErr.Status())
+			}
+			return
+		}
+
+		// Setup pod deletion (deferred to ensure cleanup)
 		defer func() {
-			clog.Info("gracefully stopping spawned tty...")
-			if err := cmd.Process.Kill(); err != nil {
-				clog.Warnf("failed to kill process: %s", err)
-			}
-			if _, err := cmd.Process.Wait(); err != nil {
-				clog.Warnf("failed to wait for process to exit: %s", err)
-			}
-			if err := tty.Close(); err != nil {
-				clog.Warnf("failed to close spawned tty gracefully: %s", err)
-			}
-			if err := connection.Close(); err != nil {
-				clog.Warnf("failed to close webscoket connection: %s", err)
+			clog.Info("Initiating pod cleanup...")
+			deleteCtx, deleteCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer deleteCancel()
+			err := clientset.CoreV1().Pods(opts.KubernetesNamespace).Delete(deleteCtx, podName, metav1.DeleteOptions{})
+			if err != nil {
+				if errors.IsNotFound(err) {
+					clog.Info("Pod already deleted")
+				} else {
+					clog.Warnf("Failed to delete pod: %s", err)
+				}
+			} else {
+				clog.Info("Pod deleted successfully")
 			}
 		}()
 
+		// Wait for pod to be ready
+		clog.Info("Waiting for pod to be ready...")
+		if err := waitForPodReady(ctx, clientset, opts.KubernetesNamespace, podName); err != nil {
+			clog.Warnf("Pod never became ready: %s", err)
+			return
+		}
+
+		// Create websocket connection to pod
+		podURL := fmt.Sprintf("wss://%s/api/v1/namespaces/%s/pods/%s/exec?command=%s&stdin=true&stdout=true&stderr=true&tty=true",
+			opts.KubernetesHost, opts.KubernetesNamespace, podName, url.QueryEscape("sh"))
+
+		clog.Debugf("Connecting to pod at: %s", podURL)
+
+		headers := http.Header{
+			"Authorization": {"Bearer " + opts.KubernetesToken},
+		}
+
+		dialer := websocket.Dialer{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		}
+
+		ttyConn, _, err := dialer.Dial(podURL, headers)
+		if err != nil {
+			clog.Warnf("Failed to connect to pod: %s", err)
+			return
+		}
+		defer ttyConn.Close()
+
+		// Connection management
 		var connectionClosed bool
 		var waiter sync.WaitGroup
 		waiter.Add(1)
 
-		// this is a keep-alive loop that ensures connection does not hang-up itself
+		// Ping-pong keepalive
 		lastPongTime := time.Now()
 		connection.SetPongHandler(func(msg string) error {
 			lastPongTime = time.Now()
 			return nil
 		})
+
+		// Goroutine for sending periodic pings
 		go func() {
+			ticker := time.NewTicker(keepalivePingTimeout / 2)
+			defer ticker.Stop()
+
 			for {
-				if err := connection.WriteMessage(websocket.PingMessage, []byte("keepalive")); err != nil {
-					clog.Warn("failed to write ping message")
+				select {
+				case <-ctx.Done():
 					return
+				case <-ticker.C:
+					if time.Since(lastPongTime) > keepalivePingTimeout {
+						clog.Warn("Ping timeout - terminating connection")
+						cancel()
+						waiter.Done()
+						return
+					}
+					if err := connection.WriteMessage(websocket.PingMessage, []byte("keepalive")); err != nil {
+						clog.Warn("Failed to send ping - terminating connection")
+						cancel()
+						waiter.Done()
+						return
+					}
 				}
-				time.Sleep(keepalivePingTimeout / 2)
-				if time.Now().Sub(lastPongTime) > keepalivePingTimeout {
-					clog.Warn("failed to get response from ping, triggering disconnect now...")
-					waiter.Done()
-					return
-				}
-				clog.Debug("received response from ping successfully")
 			}
 		}()
 
-		// tty >> xterm.js
+		// Goroutine for reading from pod and writing to client
 		go func() {
+			defer cancel()
 			errorCounter := 0
+
 			for {
-				// consider the connection closed/errored out so that the socket handler
-				// can be terminated - this frees up memory so the service doesn't get
-				// overloaded
-				if errorCounter > connectionErrorLimit {
-					waiter.Done()
-					break
-				}
-				buffer := make([]byte, maxBufferSizeBytes)
-				readLength, err := tty.Read(buffer)
-				if err != nil {
-					clog.Warnf("failed to read from tty: %s", err)
-					if err := connection.WriteMessage(websocket.TextMessage, []byte("bye!")); err != nil {
-						clog.Warnf("failed to send termination message from tty to xterm.js: %s", err)
-					}
-					waiter.Done()
+				select {
+				case <-ctx.Done():
 					return
+				default:
+					if errorCounter > connectionErrorLimit {
+						clog.Warn("Error limit exceeded - terminating connection")
+						waiter.Done()
+						return
+					}
+
+					messageType, message, err := ttyConn.ReadMessage()
+					if err != nil {
+						clog.Warnf("Failed to read from pod: %s", err)
+						waiter.Done()
+						return
+					}
+
+					if err := connection.WriteMessage(messageType, message); err != nil {
+						clog.Warnf("Failed to write to client: %s", err)
+						errorCounter++
+						continue
+					}
+
+					errorCounter = 0
 				}
-				if err := connection.WriteMessage(websocket.BinaryMessage, buffer[:readLength]); err != nil {
-					clog.Warnf("failed to send %v bytes from tty to xterm.js", readLength)
-					errorCounter++
-					continue
-				}
-				clog.Tracef("sent message of size %v bytes from tty to xterm.js", readLength)
-				errorCounter = 0
 			}
 		}()
 
-		// tty << xterm.js
+		// Goroutine for reading from client and writing to pod
 		go func() {
+			defer cancel()
+
 			for {
-				// data processing
-				messageType, data, err := connection.ReadMessage()
-				if err != nil {
-					if !connectionClosed {
-						clog.Warnf("failed to get next reader: %s", err)
-					}
+				select {
+				case <-ctx.Done():
 					return
-				}
-				dataLength := len(data)
-				dataBuffer := bytes.Trim(data, "\x00")
-				dataType, ok := WebsocketMessageType[messageType]
-				if !ok {
-					dataType = "uunknown"
-				}
-				clog.Infof("received %s (type: %v) message of size %v byte(s) from xterm.js with key sequence: %v", dataType, messageType, dataLength, dataBuffer)
-
-				// process
-				if dataLength == -1 { // invalid
-					clog.Warn("failed to get the correct number of bytes read, ignoring message")
-					continue
-				}
-
-				// handle resizing
-				if messageType == websocket.BinaryMessage {
-					if dataBuffer[0] == 1 {
-						ttySize := &TTYSize{}
-						resizeMessage := bytes.Trim(dataBuffer[1:], " \n\r\t\x00\x01")
-						if err := json.Unmarshal(resizeMessage, ttySize); err != nil {
-							clog.Warnf("failed to unmarshal received resize message '%s': %s", string(resizeMessage), err)
-							continue
+				default:
+					messageType, data, err := connection.ReadMessage()
+					if err != nil {
+						if !connectionClosed {
+							clog.Warnf("Failed to read from client: %s", err)
 						}
-						clog.Infof("resizing tty to use %v rows and %v columns...", ttySize.Rows, ttySize.Cols)
-						if err := pty.Setsize(tty, &pty.Winsize{
-							Rows: ttySize.Rows,
-							Cols: ttySize.Cols,
-						}); err != nil {
-							clog.Warnf("failed to resize tty, error: %s", err)
-						}
+						return
+					}
+
+					// Skip resize messages
+					if messageType == websocket.BinaryMessage && len(data) > 0 && data[0] == 1 {
+						continue
+					}
+
+					// Prepend channel byte (0 for stdin) and write to pod
+					message := append([]byte{0}, data...)
+					if err := ttyConn.WriteMessage(messageType, message); err != nil {
+						clog.Warnf("Failed to write to pod: %s", err)
 						continue
 					}
 				}
-
-				// write to tty
-				bytesWritten, err := tty.Write(dataBuffer)
-				if err != nil {
-					clog.Warn(fmt.Sprintf("failed to write %v bytes to tty: %s", len(dataBuffer), err))
-					continue
-				}
-				clog.Tracef("%v bytes written to tty...", bytesWritten)
 			}
 		}()
 
+		// Wait for termination
 		waiter.Wait()
-		log.Info("closing connection...")
+		clog.Info("Terminating connection...")
 		connectionClosed = true
+		cancel()
 	}
 }
+
+func waitForPodReady(ctx context.Context, clientset *kubernetes.Clientset, namespace, podName string) error {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			pod, err := clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+
+			switch pod.Status.Phase {
+			case corev1.PodRunning:
+				for _, cond := range pod.Status.Conditions {
+					if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+						return nil
+					}
+				}
+			case corev1.PodFailed, corev1.PodSucceeded:
+				return fmt.Errorf("pod terminated unexpectedly with phase: %s", pod.Status.Phase)
+			}
+		}
+	}
+}
+
+func int64Ptr(i int64) *int64 { return &i }
