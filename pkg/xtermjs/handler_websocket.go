@@ -44,7 +44,6 @@ type HandlerOpts struct {
 	// Kubernetes
 	KubernetesHost      string
 	KubernetesNamespace string
-	PodName             string
 	KubernetesToken     string
 }
 
